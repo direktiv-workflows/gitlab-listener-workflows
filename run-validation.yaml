@@ -1,0 +1,132 @@
+#
+# Ths is a run validation Python script on an uploaded SQL file
+#
+description: "Run validation Python script on an uploaded SQL file for DCS"
+
+start:
+  type: event
+  state: clone-repository
+  event: 
+    type: "Push Hook"
+    context:
+      source: "https://gitlab.com/wwonigkeit/gitlab-events-poc"
+
+functions:
+  - id: git
+    image: gcr.io/direktiv/functions/git:1.0
+    type: knative-workflow
+  - id: python
+    image: gcr.io/direktiv/functions/python:1.0
+    type: knative-workflow
+  - id: yq
+    image: gcr.io/direktiv/functions/bash:1.0
+    type: knative-workflow
+
+states:
+  - id: clone-repository
+    type: action
+    action:
+      secrets: ["GITLAB_PAT"]
+      function: git
+      input:
+        commands:
+        - command: git clone https://wwonigkeit:jq(.secrets.GITLAB_PAT)@gitlab.com/wwonigkeit/gitlab-events-poc.git out/workflow/gitlab-events-poc.tar.gz
+    transition: run-yq
+    catch:
+    - error: "*"
+      transition: exception-catch
+
+  - id: run-yq
+    type: action
+    action:
+      function: yq
+      files:
+      - key: gitlab-events-poc.tar.gz
+        scope: workflow
+        type: tar.gz
+        as: gitlab-events-poc
+      input:
+        files:
+        - name: get-yaml.sh
+          data: |-
+            #!/bin/bash
+            cd gitlab-events-poc
+            for i in `yq eval '.include[].local' .gitlab-ci.yml`; do yq -o=json $i; done | jq -s .
+          mode: '0755'
+        commands:
+        - command: ./get-yaml.sh
+    transition: run-python
+    transform: 'jq( { scripts: .return.bash[0].result } )'
+    catch:
+    - error: "*"
+      transition: exception-catch
+
+  - id: run-python
+    type: foreach
+    array: 'jq(.scripts)'
+    action:
+      # Get the contents for the Python code and the requirements from an
+      # internal Direktiv variable
+      files:
+      - key: gitlab-events-poc.tar.gz
+        scope: workflow
+        type: tar.gz
+        as: gitlab-events-poc
+      function: python
+      input:
+        files:
+        - name: run-python.sh
+          data: |-
+            #!/bin/bash
+            cd gitlab-events-poc
+            pyenv local 3.8.13
+            jq(."validate-sql-files-content".script[1])
+          mode: '0755'
+        commands:
+        - command: ./run-python.sh
+        - command: cp gitlab-events-poc/.gitlab/ci/pre-merge-validation/sql_files_metrics.txt out/workflow/sql_files_metrics.txt
+    #transform: 'jq( { messages: .return } )'
+    transition: message-event
+
+  #
+  # Now let's create an internal event which can fire off information to several plugins at once
+  #
+  - id: message-event
+    type: generateEvent
+    event:
+      type: com.direktiv.social.message.send
+      source: /run-validation
+      data: 'jq(.)'
+      datacontenttype: application/json
+    transition: message-event-wait
+
+  #
+  # Create a wait for state to ensure we have sent at least one succesfull event
+  #
+  - id: message-event-wait
+    type: consumeEvent
+    timeout: PT5M
+    event:
+      type: com.direktiv.social.message.success
+    transition: log-success
+    catch:
+    - error: "*"
+      transition: exception-catch
+
+  #
+  # Let's log the success state
+  #
+  - id: log-success
+    type: noop
+    log: 'jq(.)'
+
+  #
+  # Handle any failed connections
+  #
+  - id: exception-catch
+    log: 'Failed with the following: jq(.) - creating an incident'
+    type: generateEvent
+    event: 
+      type: com.direktiv.exception.create.incident
+      source: provision-machines
+      data: jq(.error)

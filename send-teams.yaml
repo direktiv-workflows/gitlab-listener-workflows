@@ -1,0 +1,75 @@
+#
+# This workflow is used to demonstrate the following:
+# - receives an event from an unknown workflow
+# - event listened for is: com.direktiv.social.message.send
+# - send a message with the payload to Microsoft Teams webhook
+#
+
+description: Send a message to a Teams Channel with the Storage Pools information
+
+start:
+  type: event
+  state: send-message
+  event: 
+    type: com.direktiv.social.message.send
+
+functions:
+  # Function for the Microsoft Teams webhook message transport
+  - id: teams
+    image: gcr.io/direktiv/functions/teams:1.0
+    type: knative-workflow
+
+states:
+  # First state entry: send a message to Microsoft Teams
+  - id: send-message
+    type: action
+    action:
+      function: teams
+      secrets: ["TEAMS_WEBHOOK_URL"]
+      input: 
+        webhook-url: jq(.secrets.TEAMS_WEBHOOK_URL)
+        verbose: true
+        content:
+          type: message
+          attachments:
+          - contentType: application/vnd.microsoft.card.adaptive
+            content:
+              "$schema": http://adaptivecards.io/schemas/adaptive-card.json
+              type: AdaptiveCard
+              version: '1.2'
+              body:
+              - type: TextBlock
+                size: Medium
+                weight: Bolder
+                text: Result from SQL validation
+                wrap: true
+              - type: FactSet
+                facts:
+                - title: Id
+                  value: jq(."com.direktiv.social.message.send".data.return[0].python[0].result) 
+    transition: send-success-event
+    catch:
+    - error: "*"
+      transition: exception-catch
+
+  #
+  # Now let's send the success event back to initiating workflow
+  #
+  - id: send-success-event
+    type: generateEvent
+    event:
+      type: com.direktiv.social.message.success
+      source: /send-teams
+      data: 'jq(.)'
+      datacontenttype: application/json
+
+  #
+  # Handle any failed connections
+  #
+  - id: exception-catch
+    log: 'Failed with the following: jq(.) - creating an incident'
+    type: generateEvent
+    event: 
+      type: com.direktiv.exception.create.incident
+      source: provision-machines
+      data: jq(.error)
